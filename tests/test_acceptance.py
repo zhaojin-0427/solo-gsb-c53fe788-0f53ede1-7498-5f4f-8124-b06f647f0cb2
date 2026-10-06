@@ -553,5 +553,116 @@ def test_header_aliases_accepted(client, ids):
     assert r.json()["passed"] is True
 
 
+def test_same_points_but_distinct_raw_csv_are_separately_addressed(client, ids):
+    """同测点序列、不同原始字节（仅表头别名/空白不同）须分别寻址、各自绑定原件。"""
+    job = _run_job(client, ids)
+    preds = _lab_press_at(client, job["job_id"], [(0, 0), (1, 1)])
+    rows = _points_from_preds([(0, 0), (1, 1)], preds)
+    L0, a0, b0 = (float(v) for v in preds[0])
+    L1, a1, b1 = (float(v) for v in preds[1])
+
+    # 原件 A：规范表头、规范空白。
+    csv_a = _csv(rows)
+    # 原件 B：表头用别名 + 周边空白，Lab 单元格首尾空白（解析时 .strip() 合法），
+    # CRLF 行尾 + 末尾空行；解析出的测点序列与 A 逐点相同，但原始字节不同。
+    # 注意坐标单元格按严格整数解析、不容忍空白，故不对坐标加空白。
+    csv_b = (
+        " X , Y , L*, a*, b*\r\n"
+        f"0,0, {L0} ,{a0},{b0}\r\n"
+        f"1,1,{L1}, {a1}, {b1} \r\n"
+        "\r\n"
+    ).encode("utf-8")
+
+    r1 = _accept(client, job["job_id"], csv_a, limit=3.0)
+    r2 = _accept(client, job["job_id"], csv_b, limit=3.0)
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
+    d1, d2 = r1.json(), r2.json()
+    # 原件不同 → 身份不同（第二次合法提交绝不能被判成绑定不符而 422）。
+    assert d1["acceptance_id"] != d2["acceptance_id"]
+    # 逐点结论相同（同测点序列、同预测、同上限）。
+    assert d1["passed"] == d2["passed"] is True
+    assert d1["point_count"] == d2["point_count"] == 2
+    for p1, p2 in zip(d1["points"], d2["points"]):
+        assert p1["x"] == p2["x"] and p1["y"] == p2["y"]
+        assert p1["measured_lab"] == p2["measured_lab"]
+        assert p1["predicted_lab"] == p2["predicted_lab"]
+        assert p1["de00"] == p2["de00"]
+        assert p1["over_limit"] == p2["over_limit"]
+
+    # 各自报告记录各自的原件摘要；身份指纹也携带该摘要。
+    rep1 = client.get(f"/api/acceptance/{d1['acceptance_id']}").json()
+    rep2 = client.get(f"/api/acceptance/{d2['acceptance_id']}").json()
+    import hashlib
+    sha_a = hashlib.sha256(csv_a).hexdigest()
+    sha_b = hashlib.sha256(csv_b).hexdigest()
+    assert sha_a != sha_b
+    assert rep1["measurements_csv_sha256"] == sha_a
+    assert rep2["measurements_csv_sha256"] == sha_b
+    assert rep1["request"]["measurements_csv_sha256"] == sha_a
+    assert rep2["request"]["measurements_csv_sha256"] == sha_b
+    assert rep1["request"]["points"] == rep2["request"]["points"]
+
+    # 各自下载到与提交字节逐字节一致的原件（不串用）。
+    c1 = client.get(f"/api/acceptance/{d1['acceptance_id']}/measurements.csv")
+    c2 = client.get(f"/api/acceptance/{d2['acceptance_id']}/measurements.csv")
+    assert c1.status_code == 200 and c1.content == csv_a
+    assert c2.status_code == 200 and c2.content == csv_b
+
+    # 完全相同文件重复提交：稳定复用同一身份、同一原件。
+    d3 = _accept(client, job["job_id"], csv_b, limit=3.0).json()
+    assert d3["acceptance_id"] == d2["acceptance_id"]
+    c3 = client.get(f"/api/acceptance/{d3['acceptance_id']}/measurements.csv")
+    assert c3.content == csv_b
+
+
+def test_tampered_archived_csv_rejected_for_download_and_healed_on_repost(client, ids):
+    """归档 measurements.csv 被替换：下载按报告摘要拒绝；同文件再提交可修复。"""
+    from app import main
+    job = _run_job(client, ids)
+    preds = _lab_press_at(client, job["job_id"], [(0, 0)])
+    csv_bytes = _csv(_points_from_preds([(0, 0)], preds))
+    d = _accept(client, job["job_id"], csv_bytes, limit=3.0).json()
+    aid = d["acceptance_id"]
+    csv_path = main.ACCEPTANCE_DIR / aid / "measurements.csv"
+
+    # 用另一份合法但内容不同的 CSV 替换归档原件（测点坐标仍在幅面内）。
+    forged = b"x,y,L,a,b\n0,0,12.0,3.4,-5.6\n"
+    assert forged != csv_bytes
+    csv_path.write_bytes(forged)
+    try:
+        # 下载必须拒绝：与报告固化摘要不符。
+        cc = client.get(f"/api/acceptance/{aid}/measurements.csv")
+        assert cc.status_code == 422
+        assert "摘要不符" in cc.json()["detail"]
+        # 报告本身仍可取（只读 JSON 元数据）。
+        assert client.get(f"/api/acceptance/{aid}").status_code == 200
+        # 重复提交完全相同的原文件：命中缓存并修复归档原件，而非 422。
+        rr = _accept(client, job["job_id"], csv_bytes, limit=3.0)
+        assert rr.status_code == 200, rr.text
+        assert rr.json()["acceptance_id"] == aid
+        healed = client.get(f"/api/acceptance/{aid}/measurements.csv")
+        assert healed.status_code == 200 and healed.content == csv_bytes
+    finally:
+        csv_path.write_bytes(csv_bytes)
+
+
+def test_missing_archived_csv_healed_on_identical_repost(client, ids):
+    """归档原件缺失时，重复提交同文件应恢复原件并复用。"""
+    from app import main
+    job = _run_job(client, ids)
+    preds = _lab_press_at(client, job["job_id"], [(0, 0)])
+    csv_bytes = _csv(_points_from_preds([(0, 0)], preds))
+    d = _accept(client, job["job_id"], csv_bytes, limit=3.0).json()
+    aid = d["acceptance_id"]
+    csv_path = main.ACCEPTANCE_DIR / aid / "measurements.csv"
+    csv_path.unlink()
+    assert client.get(f"/api/acceptance/{aid}/measurements.csv").status_code == 404
+    rr = _accept(client, job["job_id"], csv_bytes, limit=3.0)
+    assert rr.status_code == 200 and rr.json()["acceptance_id"] == aid
+    cc = client.get(f"/api/acceptance/{aid}/measurements.csv")
+    assert cc.status_code == 200 and cc.content == csv_bytes
+
+
 def test_acceptance_404_for_missing_report(client, ids):
     assert client.get("/api/acceptance/deadbeef").status_code == 404

@@ -20,6 +20,16 @@
 随后把预测 Lab 与 CSV 实测 Lab 逐点计算 CIEDE2000；同坐标复测逐条保留、
 不去重。**任一点 ΔE00 严格大于上限即整张不合格**。
 
+**身份与原件**：验收身份（acceptance_id）的指纹不仅包含规范后的测点序列，
+还包含**原始 CSV 字节的 SHA-256**。两份 CSV 即使解析出完全相同的测点（仅
+表头别名写法、空白/换行/BOM 等不同），也是**各自独立、分别寻址**的验收：
+得到各自的 acceptance_id、各自绑定的报告与原样保存的 measurements.csv，
+绝不共享目录，因此不存在“同身份下原件错配”。逐点结论只取决于规范测点，
+故两份提交的逐点结果相同；完全相同的 CSV 字节重复提交稳定命中同一目录
+复用。下载 measurements.csv 前会重新计算其 SHA-256 并与报告固化摘要核对，
+摘要不符（归档文件被替换）一律拒绝下载；命中缓存时若发现归档原件缺失或
+摘要不符，则用本次提交的同摘要字节原样修复后复用。
+
 下列情况一律拒绝验收（422/404），绝不用原任务值代替修色测点：修色不可达、
 修色报告或成品与任务/ICC 绑定不符、原印刷 ICC 缺失或摘要不符、测点越界、
 CSV 非法。
@@ -383,6 +393,10 @@ def predicted_labs(
 
 # ---------------------------------------------------------------------------
 # 身份指纹（规范 JSON，浮点按最短往返表示）
+#
+# 指纹同时包含**原始 CSV 字节 SHA-256** 与规范后的测点序列：解析出相同测点、
+# 但原始字节不同的两份 CSV（仅表头别名/空白/BOM/换行不同）会得到**不同**
+# acceptance_id，各自寻址、各自保存原件与报告，避免同身份下原件错配。
 # ---------------------------------------------------------------------------
 
 def _canon_float(v: float) -> float:
@@ -396,13 +410,15 @@ def _canonical_json(obj) -> str:
 
 def request_fingerprint(meta: dict, points: list[Measurement],
                         limit_de: float, retouch_id: str | None,
-                        press_digest: str) -> dict:
+                        press_digest: str, csv_sha256: str) -> dict:
     return {
         "kind": "postpress-color-acceptance",
         "job_id": meta["job_id"],
         "source_intent": meta.get(PRESS_INTENT_FIELD, ""),
         "retouch_id": retouch_id,
         "press_profile_sha256": press_digest,
+        # 原始 CSV 字节摘要参与身份：同一规范测点序列的不同原件分别寻址。
+        "measurements_csv_sha256": csv_sha256,
         "limit_de00": _canon_float(limit_de),
         "points": [
             {"x": int(p.x), "y": int(p.y),
@@ -414,6 +430,23 @@ def request_fingerprint(meta: dict, points: list[Measurement],
 
 def compute_acceptance_id(fingerprint: dict) -> str:
     return hashlib.sha256(_canonical_json(fingerprint).encode("utf-8")).hexdigest()
+
+
+def read_stored_csv(csv_path: Path) -> bytes | None:
+    """读取归档测点原件；不存在或不可读时返回 None。"""
+    try:
+        return csv_path.read_bytes()
+    except OSError:
+        return None
+
+
+def stored_csv_matches_report(report: dict, csv_path: Path) -> bool:
+    """归档 measurements.csv 的 SHA-256 是否与报告固化摘要严格一致。"""
+    expected = report.get("measurements_csv_sha256")
+    if not isinstance(expected, str) or len(expected) != 64:
+        return False
+    blob = read_stored_csv(csv_path)
+    return blob is not None and hashlib.sha256(blob).hexdigest() == expected
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +606,11 @@ def verify_report_binding(
     csv_sha256: str,
 ) -> bool:
     """命中缓存时逐项核对报告与**本次请求**的绑定及全部逐点结果。
+
+    指纹已包含原始 CSV 字节摘要，故这里核对 ``request == fingerprint`` 即同时
+    确认“规范测点序列 + 原件摘要”与本次提交一致；再显式核对报告顶层记录的
+    CSV 摘要。注意：本函数只核对报告**内容**，不触碰磁盘上的 measurements.csv
+    ——归档原件的存在性与字节摘要由调用方另行核对/修复（见 main 流程）。
 
     任一不符返回 False（调用方据此拒绝验收，而不是用原任务值代替或静默重算）。
     """

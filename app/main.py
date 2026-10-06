@@ -582,12 +582,15 @@ async def create_acceptance(
             raise HTTPException(422, f"修色成品无法核验: {exc}")
 
     csv_sha = hashlib.sha256(csv_bytes).hexdigest()
+    # 身份指纹包含原始 CSV 字节摘要：同一规范测点序列的不同原件（仅表头别名/
+    # 空白/BOM 等不同）各自寻址，得到各自的 acceptance_id、报告与原样 CSV。
     fingerprint = ac.request_fingerprint(
-        meta, points, limit_de, rid, digest
+        meta, points, limit_de, rid, digest, csv_sha
     )
     acceptance_id = ac.compute_acceptance_id(fingerprint)
     base = _acceptance_dir(acceptance_id)
     report_path = base / "report.json"
+    csv_path = base / "measurements.csv"
 
     report = None
     if report_path.exists():
@@ -600,6 +603,11 @@ async def create_acceptance(
             press_bytes, press_summary_full, rid, retouch_report,
             verified_tiff, csv_sha,
         ):
+            # 报告内容与本次提交逐项一致（含原件摘要）。归档 measurements.csv
+            # 若缺失或被另一份字节替换（与报告摘要不符），用本次提交的、摘要
+            # 已核验相同的字节原样修复后再复用——不静默交付错配原件。
+            if not ac.stored_csv_matches_report(cached, csv_path):
+                csv_path.write_bytes(csv_bytes)
             report = cached
         elif cached is not None:
             # 内容寻址目录出现绑定不符的脏文件：拒绝验收而不是静默覆盖。
@@ -616,7 +624,7 @@ async def create_acceptance(
             acceptance_id, fingerprint, ctx, points, limit_de,
             rid, retouch_report, evaluation, csv_sha,
         )
-        (base / "measurements.csv").write_bytes(csv_bytes)
+        csv_path.write_bytes(csv_bytes)
         report_path.write_text(
             json.dumps(report, sort_keys=True, ensure_ascii=False, indent=2),
             "utf-8",
@@ -670,6 +678,16 @@ def get_acceptance_csv(acceptance_id: str):
     csv_path = base / "measurements.csv"
     if not csv_path.exists():
         raise HTTPException(404, "验收测点 CSV 不存在")
+    try:
+        report = json.loads((base / "report.json").read_text("utf-8"))
+    except (json.JSONDecodeError, OSError):
+        raise HTTPException(422, "验收报告不可读，无法核验测点原件摘要")
+    # 交出原件前重新计算 SHA-256 并与报告固化摘要核对：归档 CSV 被另一份字节
+    # 替换时绝不下载与报告摘要不符的文件。
+    if not ac.stored_csv_matches_report(report, csv_path):
+        raise HTTPException(
+            422, "归档测点 CSV 与验收报告记录的 SHA-256 摘要不符，拒绝下载"
+        )
     return FileResponse(
         csv_path, media_type="text/csv",
         filename=f"measurements-{acceptance_id[:12]}.csv",
