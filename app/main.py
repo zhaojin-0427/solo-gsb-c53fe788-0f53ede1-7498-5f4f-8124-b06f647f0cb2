@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
@@ -582,8 +582,10 @@ async def create_acceptance(
             raise HTTPException(422, f"修色成品无法核验: {exc}")
 
     csv_sha = hashlib.sha256(csv_bytes).hexdigest()
+    # 原始 CSV 字节摘要纳入验收身份：同一测点序列的不同原始文件分别寻址，
+    # 各自拥有报告与归档原件；重复相同文件才命中同一身份稳定复用。
     fingerprint = ac.request_fingerprint(
-        meta, points, limit_de, rid, digest
+        meta, points, limit_de, rid, digest, csv_sha
     )
     acceptance_id = ac.compute_acceptance_id(fingerprint)
     base = _acceptance_dir(acceptance_id)
@@ -598,13 +600,14 @@ async def create_acceptance(
         if cached is not None and ac.verify_report_binding(
             cached, acceptance_id, fingerprint, ctx, points, limit_de,
             press_bytes, press_summary_full, rid, retouch_report,
-            verified_tiff, csv_sha,
+            verified_tiff, csv_sha, base / "measurements.csv",
         ):
             report = cached
         elif cached is not None:
-            # 内容寻址目录出现绑定不符的脏文件：拒绝验收而不是静默覆盖。
+            # 内容寻址目录出现绑定不符的脏文件（含归档原件被替换）：拒绝验收
+            # 而不是静默覆盖。
             raise HTTPException(
-                422, "已存在的验收报告与当前任务/ICC/修色绑定核验不符，拒绝验收"
+                422, "已存在的验收报告/测点原件与当前任务/ICC/修色绑定核验不符，拒绝验收"
             )
 
     if report is None:
@@ -670,9 +673,28 @@ def get_acceptance_csv(acceptance_id: str):
     csv_path = base / "measurements.csv"
     if not csv_path.exists():
         raise HTTPException(404, "验收测点 CSV 不存在")
-    return FileResponse(
-        csv_path, media_type="text/csv",
-        filename=f"measurements-{acceptance_id[:12]}.csv",
+    # 交出原件前核验：报告必须绑定本身份，且归档字节摘要与报告记录一致——
+    # 原件被替换（或报告不可读无法核验）即拒绝下载，绝不交出与报告摘要
+    # 不符的文件。
+    try:
+        report = json.loads((base / "report.json").read_text("utf-8"))
+    except (json.JSONDecodeError, OSError):
+        raise HTTPException(422, "验收报告不可读，无法核验测点原件摘要，拒绝下载")
+    if not isinstance(report, dict) or report.get("acceptance_id") != acceptance_id:
+        raise HTTPException(422, "验收报告与所请求的验收身份不符，拒绝下载")
+    recorded = report.get("measurements_csv_sha256")
+    data = csv_path.read_bytes()
+    if not recorded or hashlib.sha256(data).hexdigest() != recorded:
+        raise HTTPException(
+            422, "归档测点 CSV 与验收报告记录的原件摘要不符（可能被替换），拒绝下载"
+        )
+    # 直接交出本次核验过的字节（避免核验后再读文件的替换窗口）。
+    return Response(
+        content=data, media_type="text/csv",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="measurements-{acceptance_id[:12]}.csv"'
+        },
     )
 
 

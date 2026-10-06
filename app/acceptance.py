@@ -20,6 +20,15 @@
 随后把预测 Lab 与 CSV 实测 Lab 逐点计算 CIEDE2000；同坐标复测逐条保留、
 不去重。**任一点 ΔE00 严格大于上限即整张不合格**。
 
+**测点原件分别寻址**：同一测点序列可能来自字节不同的原始 CSV（仅改合法
+表头别名、增删空白行等，解析结果相同）。本模块把**原始 CSV 字节的
+SHA-256 纳入验收身份指纹**——同一身份唯一对应一份报告与一份归档原件；
+字节不同的合法变体各自得到独立的验收 ID、报告与 ``measurements.csv``
+（逐点结论相同、互不串用）；重复提交**相同文件**才命中同一身份稳定复用。
+报告记录的原件摘要、命中缓存时的复用核验（含归档原件字节核对）与
+``measurements.csv`` 下载端点的交出前核验遵守同一规则：**归档原件与报告
+记录摘要不符（被替换）即判绑定不符**，复用核验拒绝复用、下载端点拒绝交出。
+
 下列情况一律拒绝验收（422/404），绝不用原任务值代替修色测点：修色不可达、
 修色报告或成品与任务/ICC 绑定不符、原印刷 ICC 缺失或摘要不符、测点越界、
 CSV 非法。
@@ -382,7 +391,7 @@ def predicted_labs(
 
 
 # ---------------------------------------------------------------------------
-# 身份指纹（规范 JSON，浮点按最短往返表示）
+# 身份指纹（规范 JSON，浮点按最短往返表示；含原始 CSV 字节摘要——分别寻址）
 # ---------------------------------------------------------------------------
 
 def _canon_float(v: float) -> float:
@@ -396,7 +405,7 @@ def _canonical_json(obj) -> str:
 
 def request_fingerprint(meta: dict, points: list[Measurement],
                         limit_de: float, retouch_id: str | None,
-                        press_digest: str) -> dict:
+                        press_digest: str, csv_sha256: str) -> dict:
     return {
         "kind": "postpress-color-acceptance",
         "job_id": meta["job_id"],
@@ -404,6 +413,10 @@ def request_fingerprint(meta: dict, points: list[Measurement],
         "retouch_id": retouch_id,
         "press_profile_sha256": press_digest,
         "limit_de00": _canon_float(limit_de),
+        # 原始 CSV 字节摘要是验收身份的一部分：同一测点序列、字节不同的合法
+        # 原始文件（表头别名/空白等变体）分别寻址，各自拥有报告与归档原件；
+        # 只有重复提交相同文件才命中同一身份稳定复用。
+        "measurements_csv_sha256": csv_sha256,
         "points": [
             {"x": int(p.x), "y": int(p.y),
              "L": _canon_float(p.L), "a": _canon_float(p.a), "b": _canon_float(p.b)}
@@ -571,8 +584,13 @@ def verify_report_binding(
     retouch_report: dict | None,
     verified_tiff: np.ndarray | None,
     csv_sha256: str,
+    csv_path: Path,
 ) -> bool:
     """命中缓存时逐项核对报告与**本次请求**的绑定及全部逐点结果。
+
+    除报告字段与逐点数值外，还核对**归档原件**：``csv_path`` 必须存在且其
+    字节 SHA-256 与报告记录（亦即本次提交文件）的摘要一致——归档
+    ``measurements.csv`` 被替换同样判绑定不符。
 
     任一不符返回 False（调用方据此拒绝验收，而不是用原任务值代替或静默重算）。
     """
@@ -584,6 +602,13 @@ def verify_report_binding(
         if report.get("request") != fingerprint:
             return False
         if report.get("measurements_csv_sha256") != csv_sha256:
+            return False
+        # 归档的测点原件必须存在且字节摘要与报告记录一致（被替换即不符）。
+        try:
+            archived_csv = csv_path.read_bytes()
+        except OSError:
+            return False
+        if hashlib.sha256(archived_csv).hexdigest() != csv_sha256:
             return False
         if report.get("profiles", {}).get("press", {}).get("sha256") != \
                 hashlib.sha256(press_bytes).hexdigest():
